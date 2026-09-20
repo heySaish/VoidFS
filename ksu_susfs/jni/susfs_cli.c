@@ -15,6 +15,7 @@
 #define SYS_REBOOT __NR_reboot
 
 #define CMD_SUSFS_ADD_SUS_PATH     0x55550
+#define CMD_SUSFS_REMOVE_SUS_PATH  0x55551
 #define CMD_SUSFS_ADD_SUS_MOUNT    0x55560
 #define CMD_SUSFS_ADD_SUS_KSTAT    0x55570
 #define CMD_SUSFS_UPDATE_SUS_KSTAT 0x55571
@@ -33,6 +34,24 @@ struct st_susfs_sus_path {
 
 struct st_susfs_sus_mount {
     char target_pathname[SUSFS_MAX_LEN_PATHNAME];
+};
+
+struct st_susfs_sus_kstat {
+    int                     is_statically;
+    unsigned long           target_ino;
+    char                    target_pathname[SUSFS_MAX_LEN_PATHNAME];
+    unsigned long           spoofed_ino;
+    unsigned long           spoofed_dev;
+    unsigned int            spoofed_nlink;
+    long long               spoofed_size;
+    long                    spoofed_atime_tv_sec;
+    long                    spoofed_mtime_tv_sec;
+    long                    spoofed_ctime_tv_sec;
+    long                    spoofed_atime_tv_nsec;
+    long                    spoofed_mtime_tv_nsec;
+    long                    spoofed_ctime_tv_nsec;
+    unsigned long           spoofed_blksize;
+    unsigned long long      spoofed_blocks;
 };
 
 struct st_susfs_uname {
@@ -131,7 +150,9 @@ static void print_help(void) {
     printf("Commands:\n");
     printf("  show version                 Show SUSFS kernel engine version\n");
     printf("  add_sus_path <path>          Hide file/directory from non-root app processes\n");
+    printf("  remove_sus_path <path>       Remove hidden file/directory from sus_path list\n");
     printf("  add_sus_mount <mount_path>   Hide mountpoint from /proc/self/mountinfo\n");
+    printf("  add_sus_kstat <path>         Spoof kstat attributes for target path\n");
     printf("  set_uname <release> <ver>    Spoof kernel release and version strings\n");
     printf("  enable_log <0|1>             Enable (1) or disable (0) kernel debug logging\n");
     printf("  status [--json]              Check live SUSFS kernel engine status (JSON support)\n");
@@ -186,6 +207,21 @@ int main(int argc, char *argv[]) {
             printf("[-] Failed adding SUS Path (ret: %d)\n", ret);
         }
         close(fd);
+    } else if (!strcmp(argv[1], "remove_sus_path") && argc >= 3) {
+        int fd = get_ksu_fd();
+        struct st_susfs_sus_path info = {0};
+        struct stat sb;
+        if (stat(argv[2], &sb) == 0) {
+            info.target_ino = sb.st_ino;
+        }
+        strncpy(info.target_pathname, argv[2], SUSFS_MAX_LEN_PATHNAME - 1);
+        int ret = ioctl(fd, CMD_SUSFS_REMOVE_SUS_PATH, &info);
+        if (ret == 0) {
+            printf("[+] Successfully removed SUS Path: %s\n", argv[2]);
+        } else {
+            printf("[-] Failed removing SUS Path (ret: %d)\n", ret);
+        }
+        close(fd);
     } else if (!strcmp(argv[1], "add_sus_mount") && argc >= 3) {
         int fd = get_ksu_fd();
         struct st_susfs_sus_mount info = {0};
@@ -195,6 +231,34 @@ int main(int argc, char *argv[]) {
             printf("[+] Successfully added SUS Mount: %s\n", argv[2]);
         } else {
             printf("[-] Failed adding SUS Mount (ret: %d)\n", ret);
+        }
+        close(fd);
+    } else if (!strcmp(argv[1], "add_sus_kstat") && argc >= 3) {
+        struct stat sb;
+        if (stat(argv[2], &sb) != 0) {
+            printf("[-] Error: Target path '%s' does not exist.\n", argv[2]);
+            return 1;
+        }
+        int fd = get_ksu_fd();
+        struct st_susfs_sus_kstat info = {0};
+        info.is_statically = 1;
+        info.target_ino = sb.st_ino;
+        strncpy(info.target_pathname, argv[2], SUSFS_MAX_LEN_PATHNAME - 1);
+        info.spoofed_ino = sb.st_ino;
+        info.spoofed_dev = sb.st_dev;
+        info.spoofed_nlink = sb.st_nlink;
+        info.spoofed_size = sb.st_size;
+        info.spoofed_atime_tv_sec = sb.st_atime;
+        info.spoofed_mtime_tv_sec = sb.st_mtime;
+        info.spoofed_ctime_tv_sec = sb.st_ctime;
+        info.spoofed_blksize = sb.st_blksize;
+        info.spoofed_blocks = sb.st_blocks;
+
+        int ret = ioctl(fd, CMD_SUSFS_ADD_SUS_KSTAT, &info);
+        if (ret == 0) {
+            printf("[+] Successfully added SUS Kstat: %s\n", argv[2]);
+        } else {
+            printf("[-] Failed adding SUS Kstat (ret: %d)\n", ret);
         }
         close(fd);
     } else if (!strcmp(argv[1], "set_uname") && argc >= 4) {
