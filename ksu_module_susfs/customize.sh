@@ -16,6 +16,11 @@ elif [ ${ARCH} = "arm" ]; then
         cp ${TMPDIR}/susfs/tools/sus_su_arm ${DEST_BIN_DIR}/sus_su
 fi
 
+if [ -f ${TMPDIR}/susfs/system/bin/susfs ]; then
+        cp ${TMPDIR}/susfs/system/bin/susfs ${DEST_BIN_DIR}/susfs
+        chmod 755 ${DEST_BIN_DIR}/susfs
+fi
+
 chmod 755 ${DEST_BIN_DIR}/ksu_susfs ${DEST_BIN_DIR}/sus_su
 chmod 644 ${MODPATH}/post-fs-data.sh ${MODPATH}/service.sh ${MODPATH}/uninstall.sh
 

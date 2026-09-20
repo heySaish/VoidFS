@@ -1,0 +1,164 @@
+#!/data/data/com.termux/files/usr/bin/python3
+# ==========================================================================
+# VoidSU SUSFS CLI Manager Tool (susfs)
+# Works directly with VoidKernel IOCTL & Supercall Bridge
+# ==========================================================================
+import sys
+import os
+import ctypes
+import fcntl
+
+KSU_MAGIC1 = 0xDEADBEEF
+KSU_MAGIC2 = 0xCAFEBABE
+SYS_REBOOT = 142
+
+CMD_SUSFS_ADD_SUS_PATH = 0x55550
+CMD_SUSFS_ADD_SUS_MOUNT = 0x55560
+CMD_SUSFS_ADD_SUS_KSTAT = 0x55570
+CMD_SUSFS_UPDATE_SUS_KSTAT = 0x55571
+CMD_SUSFS_ADD_TRY_UMOUNT = 0x55580
+CMD_SUSFS_SET_UNAME = 0x55590
+CMD_SUSFS_ENABLE_LOG = 0x555a0
+CMD_SUSFS_SHOW_VERSION = 0x555e2
+CMD_SUSFS_SUS_SU = 0x60000
+
+def get_ksu_fd():
+    if os.geteuid() != 0:
+        print("[-] Error: Must run as root (su)!")
+        sys.exit(1)
+    
+    libc = ctypes.CDLL(None)
+    reply_fd = ctypes.c_int(-1)
+    res = libc.syscall(SYS_REBOOT, ctypes.c_uint32(KSU_MAGIC1), ctypes.c_uint32(KSU_MAGIC2), 0, ctypes.byref(reply_fd))
+    
+    if reply_fd.value < 0:
+        print("[-] Error: Failed to acquire KernelSU supercall FD.")
+        sys.exit(1)
+    
+    return reply_fd.value
+
+def print_help():
+    print("""VoidSU SUSFS CLI Tool v1.4.2 (VoidKernel Native)
+Usage: susfs <command> [args]
+
+Commands:
+  show version                 Show SUSFS kernel engine version
+  add_sus_path <path>          Hide file/directory from non-root app processes
+  add_sus_mount <mount_path>   Hide mountpoint from /proc/self/mountinfo
+  set_uname <release> <ver>    Spoof kernel release and version strings
+  enable_log <0|1>             Enable (1) or disable (0) kernel debug logging
+  status                       Check live SUSFS kernel engine status
+""")
+
+def cmd_show_version():
+    fd = get_ksu_fd()
+    buf = bytearray(32)
+    try:
+        fcntl.ioctl(fd, CMD_SUSFS_SHOW_VERSION, buf)
+        ver = buf.decode('utf-8', errors='ignore').strip(chr(0))
+        print(f"SUSFS Version: {ver}")
+    except Exception as e:
+        print("[-] Error fetching version:", e)
+    finally:
+        os.close(fd)
+
+def cmd_add_sus_path(target_path):
+    if not os.path.exists(target_path):
+        print(f"[-] Error: Target path '{target_path}' does not exist.")
+        sys.exit(1)
+    
+    st = os.stat(target_path)
+    fd = get_ksu_fd()
+    
+    # struct st_susfs_sus_path { target_ino (8 bytes), target_pathname (256 bytes) }
+    path_buf = bytearray(264)
+    b_path = target_path.encode('utf-8')
+    path_buf[0:8] = ctypes.c_ulong(st.st_ino)
+    path_buf[8:8+len(b_path)] = b_path
+    
+    try:
+        ret = fcntl.ioctl(fd, CMD_SUSFS_ADD_SUS_PATH, path_buf)
+        if ret == 0:
+            print(f"[+] Successfully added SUS Path (ino: {st.st_ino}): {target_path}")
+        else:
+            print(f"[-] Failed adding SUS Path (ret: {ret})")
+    except Exception as e:
+        print("[-] Error adding SUS Path:", e)
+    finally:
+        os.close(fd)
+
+def cmd_add_sus_mount(target_mount):
+    fd = get_ksu_fd()
+    path_buf = bytearray(256)
+    b_mount = target_mount.encode('utf-8')
+    path_buf[0:len(b_mount)] = b_mount
+    
+    try:
+        ret = fcntl.ioctl(fd, CMD_SUSFS_ADD_SUS_MOUNT, path_buf)
+        if ret == 0:
+            print(f"[+] Successfully added SUS Mount: {target_mount}")
+        else:
+            print(f"[-] Failed adding SUS Mount (ret: {ret})")
+    except Exception as e:
+        print("[-] Error adding SUS Mount:", e)
+    finally:
+        os.close(fd)
+
+def cmd_set_uname(release, version):
+    fd = get_ksu_fd()
+    buf = bytearray(130)
+    b_rel = release.encode('utf-8')
+    b_ver = version.encode('utf-8')
+    buf[0:len(b_rel)] = b_rel
+    buf[65:65+len(b_ver)] = b_ver
+    
+    try:
+        ret = fcntl.ioctl(fd, CMD_SUSFS_SET_UNAME, buf)
+        print(f"[+] Set Uname Spoofing returned: {ret}")
+    except Exception as e:
+        print("[-] Error setting Uname:", e)
+    finally:
+        os.close(fd)
+
+def cmd_enable_log(enable_val):
+    val = int(enable_val)
+    fd = get_ksu_fd()
+    try:
+        ret = fcntl.ioctl(fd, CMD_SUSFS_ENABLE_LOG, ctypes.c_ulong(val))
+        print(f"[+] Enable Log returned: {ret}")
+    except Exception as e:
+        print("[-] Error enabling log:", e)
+    finally:
+        os.close(fd)
+
+def cmd_status():
+    print("=== VoidKernel SUSFS Status ===")
+    cmd_show_version()
+    os.system("uname -a")
+    print("\n--- Recent dmesg SUSFS Logs ---")
+    os.system("dmesg | grep -i susfs | tail -n 10")
+
+def main():
+    if len(sys.argv) < 2:
+        print_help()
+        sys.exit(0)
+    
+    cmd = sys.argv[1].lower()
+    
+    if cmd == "show" and len(sys.argv) >= 3 and sys.argv[2].lower() == "version":
+        cmd_show_version()
+    elif cmd == "add_sus_path" and len(sys.argv) >= 3:
+        cmd_add_sus_path(sys.argv[2])
+    elif cmd == "add_sus_mount" and len(sys.argv) >= 3:
+        cmd_add_sus_mount(sys.argv[2])
+    elif cmd == "set_uname" and len(sys.argv) >= 4:
+        cmd_set_uname(sys.argv[2], sys.argv[3])
+    elif cmd == "enable_log" and len(sys.argv) >= 3:
+        cmd_enable_log(sys.argv[2])
+    elif cmd == "status":
+        cmd_status()
+    else:
+        print_help()
+
+if __name__ == "__main__":
+    main()
