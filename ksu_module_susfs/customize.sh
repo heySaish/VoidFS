@@ -9,19 +9,20 @@ fi
 unzip ${ZIPFILE} -d ${TMPDIR}/susfs
 
 if [ ${ARCH} = "arm64" ]; then
-        cp ${TMPDIR}/susfs/tools/ksu_susfs_arm64 ${DEST_BIN_DIR}/ksu_susfs
-        cp ${TMPDIR}/susfs/tools/sus_su_arm64 ${DEST_BIN_DIR}/sus_su
+        if [ -f ${TMPDIR}/susfs/tools/susfs_standalone ]; then
+                cp ${TMPDIR}/susfs/tools/susfs_standalone ${DEST_BIN_DIR}/susfs
+                cp ${TMPDIR}/susfs/tools/susfs_standalone ${DEST_BIN_DIR}/ksu_susfs
+                chmod 755 ${DEST_BIN_DIR}/susfs ${DEST_BIN_DIR}/ksu_susfs
+        else
+                cp ${TMPDIR}/susfs/tools/ksu_susfs_arm64 ${DEST_BIN_DIR}/ksu_susfs
+                cp ${TMPDIR}/susfs/tools/sus_su_arm64 ${DEST_BIN_DIR}/sus_su
+        fi
 elif [ ${ARCH} = "arm" ]; then
         cp ${TMPDIR}/susfs/tools/ksu_susfs_arm ${DEST_BIN_DIR}/ksu_susfs
         cp ${TMPDIR}/susfs/tools/sus_su_arm ${DEST_BIN_DIR}/sus_su
 fi
 
-if [ -f ${TMPDIR}/susfs/system/bin/susfs ]; then
-        cp ${TMPDIR}/susfs/system/bin/susfs ${DEST_BIN_DIR}/susfs
-        chmod 755 ${DEST_BIN_DIR}/susfs
-fi
-
-chmod 755 ${DEST_BIN_DIR}/ksu_susfs ${DEST_BIN_DIR}/sus_su
+chmod 755 ${DEST_BIN_DIR}/ksu_susfs ${DEST_BIN_DIR}/susfs 2>/dev/null || true
 chmod 644 ${MODPATH}/post-fs-data.sh ${MODPATH}/service.sh ${MODPATH}/uninstall.sh
 
 rm -rf ${MODPATH}/tools
