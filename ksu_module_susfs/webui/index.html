@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <title>VoidSU SUSFS Dashboard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=Roboto+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="app" class="app-container">
+
+    <!-- Top App Bar -->
+    <header class="app-bar">
+      <div class="brand">
+        <div class="brand-logo">
+          <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </div>
+        <div class="brand-text">
+          <h1>VoidSU SUSFS</h1>
+          <span class="subtitle">Kernel Protection Dashboard</span>
+        </div>
+      </div>
+      <div class="badge-status" id="susfsStatusBadge">
+        <span class="pulse-dot"></span>
+        <span id="statusText">SUSFS v1.4.2 Connected</span>
+      </div>
+    </header>
+
+    <!-- Main Content Area -->
+    <main class="main-content">
+
+      <!-- SECTION: OVERVIEW -->
+      <section id="view-overview" class="view-page active">
+        <div class="hero-card glass">
+          <div class="hero-header">
+            <div class="hero-icon">⚡</div>
+            <div>
+              <h2>VoidKernel Status</h2>
+              <p class="hero-desc" id="kernelVerText">Linux 5.15.178-VoidKernel #1 PREEMPT</p>
+            </div>
+          </div>
+          <div class="stats-grid">
+            <div class="stat-box">
+              <span class="stat-label">SUSFS ENGINE</span>
+              <span class="stat-value highlight" id="susfsEngineVer">v1.4.2</span>
+            </div>
+            <div class="stat-box">
+              <span class="stat-label">SUPERCALL BRIDGE</span>
+              <span class="stat-value success">Active (IOCTL)</span>
+            </div>
+            <div class="stat-box">
+              <span class="stat-label">ACTIVE SUS PATHS</span>
+              <span class="stat-value" id="pathCountStat">0</span>
+            </div>
+            <div class="stat-box">
+              <span class="stat-label">SUS MOUNTS</span>
+              <span class="stat-value" id="mountCountStat">0</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="card-grid">
+          <div class="card glass">
+            <div class="card-header">
+              <h3>⚡ Quick Controls</h3>
+            </div>
+            <div class="card-body">
+              <div class="toggle-row">
+                <div class="toggle-info">
+                  <span class="toggle-title">Kernel SUSFS Debug Logging</span>
+                  <span class="toggle-desc">Enable detailed dmesg logs for SUSFS operations</span>
+                </div>
+                <label class="switch">
+                  <input type="checkbox" id="toggleKernelLog" onchange="toggleKernelLogSetting(this.checked)">
+                  <span class="slider"></span>
+                </label>
+              </div>
+
+              <div class="toggle-row">
+                <div class="toggle-info">
+                  <span class="toggle-title">Hide Mounts For Non-SU</span>
+                  <span class="toggle-desc">Prevent non-root processes from viewing sus mounts</span>
+                </div>
+                <label class="switch">
+                  <input type="checkbox" id="toggleHideMountsNonSu" onchange="toggleHideMountsNonSuSetting(this.checked)">
+                  <span class="slider"></span>
+                </label>
+              </div>
+            </div>
+          </div>
+
+          <div class="card glass">
+            <div class="card-header">
+              <h3>🛡️ Recommended Security Presets</h3>
+            </div>
+            <div class="card-body">
+              <div class="preset-btn-grid">
+                <button class="btn btn-primary" onclick="applyStandardHidingPreset()">
+                  <span>🛡️ Apply Standard Hiding Rules</span>
+                </button>
+                <button class="btn btn-secondary" onclick="refreshSystemState()">
+                  <span>🔄 Refresh State</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- SECTION: PATH HIDING (0x55550) -->
+      <section id="view-paths" class="view-page">
+        <div class="card glass">
+          <div class="card-header">
+            <h3>📁 Add Hidden Path (CMD_SUSFS_ADD_SUS_PATH)</h3>
+          </div>
+          <div class="card-body">
+            <p class="input-help">Path and all sub-paths will be hidden from non-root app processes (filldir64/namei/stat).</p>
+            <div class="input-group">
+              <input type="text" id="inputPathToHide" placeholder="/system/addon.d or /sdcard/secret" class="form-input">
+              <button class="btn btn-accent" onclick="addCustomSusPath()">Add Path</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="card glass">
+          <div class="card-header flex-between">
+            <h3>📋 Currently Configured SUS Paths</h3>
+            <button class="btn-icon" onclick="loadSusPathsList()">🔄</button>
+          </div>
+          <div class="card-body">
+            <ul id="susPathsList" class="custom-list">
+              <li class="empty-state">No paths added yet. Add one above!</li>
+            </ul>
+          </div>
+        </div>
+      </section>
+
+      <!-- SECTION: MOUNT HIDING (0x55560) -->
+      <section id="view-mounts" class="view-page">
+        <div class="card glass">
+          <div class="card-header">
+            <h3>🏔️ Add Hidden Mount (CMD_SUSFS_ADD_SUS_MOUNT)</h3>
+          </div>
+          <div class="card-body">
+            <p class="input-help">Hides mount entries from /proc/self/mounts and /proc/self/mountinfo for app processes.</p>
+            <div class="input-group">
+              <input type="text" id="inputMountToHide" placeholder="/data/adb/modules or /system/etc/hosts" class="form-input">
+              <button class="btn btn-accent" onclick="addCustomSusMount()">Add Mount</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="card glass">
+          <div class="card-header">
+            <h3>⚡ Quick Mount Presets</h3>
+          </div>
+          <div class="card-body">
+            <div class="preset-chips">
+              <button class="chip" onclick="addMountPreset('/data/adb/modules')">+ /data/adb/modules</button>
+              <button class="chip" onclick="addMountPreset('/system/etc/hosts')">+ /system/etc/hosts</button>
+              <button class="chip" onclick="addMountPreset('/debug_ramdisk')">+ /debug_ramdisk</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="card glass">
+          <div class="card-header flex-between">
+            <h3>📋 Currently Configured SUS Mounts</h3>
+            <button class="btn-icon" onclick="loadSusMountsList()">🔄</button>
+          </div>
+          <div class="card-body">
+            <ul id="susMountsList" class="custom-list">
+              <li class="empty-state">No mounts added yet. Select a preset above!</li>
+            </ul>
+          </div>
+        </div>
+      </section>
+
+      <!-- SECTION: UNAME SPOOFING & TOOLS -->
+      <section id="view-uname" class="view-page">
+        <div class="card glass">
+          <div class="card-header">
+            <h3>🏷️ Kernel Uname Spoofing (CMD_SUSFS_SET_UNAME)</h3>
+          </div>
+          <div class="card-body">
+            <p class="input-help">Spoofs release and version strings in /proc/version and uname() for non-root apps.</p>
+            <div class="form-group">
+              <label class="form-label">Kernel Release String</label>
+              <input type="text" id="inputUnameRelease" placeholder="e.g. 5.15.178-VoidKernel" class="form-input">
+            </div>
+            <div class="form-group">
+              <label class="form-label">Kernel Version String</label>
+              <input type="text" id="inputUnameVersion" placeholder="e.g. #1 SMP PREEMPT Sat Sep 19 2026" class="form-input">
+            </div>
+            <button class="btn btn-accent full-width" onclick="applyUnameSpoofing()">Apply Uname Spoofing</button>
+          </div>
+        </div>
+
+        <div class="card glass">
+          <div class="card-header">
+            <h3>📄 Terminal Log Output</h3>
+          </div>
+          <div class="card-body">
+            <pre id="terminalLogOutput" class="terminal-box">VoidSU SUSFS WebUI Initialized. Ready for commands.</pre>
+          </div>
+        </div>
+      </section>
+
+    </main>
+
+    <!-- Bottom Navigation Bar (Material 3 Style) -->
+    <nav class="bottom-nav">
+      <button class="nav-item active" onclick="switchTab('overview', this)">
+        <div class="nav-icon">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor">
+            <path d="M3 13h8V3H3v10zm0 8h8v-6H3v6zm10 0h8v-10h-8v10zm0-18v6h8V3h-8z"/>
+          </svg>
+        </div>
+        <span class="nav-label">Overview</span>
+      </button>
+
+      <button class="nav-item" onclick="switchTab('paths', this)">
+        <div class="nav-icon">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor">
+            <path d="M10 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z"/>
+          </svg>
+        </div>
+        <span class="nav-label">Paths</span>
+      </button>
+
+      <button class="nav-item" onclick="switchTab('mounts', this)">
+        <div class="nav-icon">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor">
+            <path d="M14 6l-3.75 5 2.85 3.8L11.5 16 6 8.5 2 14h20L14 6z"/>
+          </svg>
+        </div>
+        <span class="nav-label">Mounts</span>
+      </button>
+
+      <button class="nav-item" onclick="switchTab('uname', this)">
+        <div class="nav-icon">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor">
+            <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/>
+          </svg>
+        </div>
+        <span class="nav-label">Uname</span>
+      </button>
+    </nav>
+
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
