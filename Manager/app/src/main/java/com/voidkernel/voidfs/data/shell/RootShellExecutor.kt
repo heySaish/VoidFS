@@ -3,7 +3,6 @@ package com.voidkernel.voidfs.data.shell
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.BufferedReader
-import java.io.DataOutputStream
 import java.io.InputStreamReader
 
 data class ShellResult(
@@ -18,14 +17,9 @@ object RootShellExecutor {
 
     suspend fun runCommand(command: String): ShellResult = withContext(Dispatchers.IO) {
         try {
-            val process = ProcessBuilder("su").start()
-            val os = DataOutputStream(process.outputStream)
+            val process = ProcessBuilder("su", "-c", command).start()
             val stdoutReader = BufferedReader(InputStreamReader(process.inputStream))
             val stderrReader = BufferedReader(InputStreamReader(process.errorStream))
-
-            os.writeBytes("$command\n")
-            os.writeBytes("exit\n")
-            os.flush()
 
             val stdoutBuilder = StringBuilder()
             var line: String?
