@@ -381,6 +381,20 @@ static void print_status_json(void) {
     printf("}\n");
 }
 
+static int path_exists_on_disk(const char *path) {
+    if (!path) return 0;
+    int fd = open(path, O_PATH | O_NOFOLLOW);
+    if (fd >= 0) {
+        close(fd);
+        return 1;
+    }
+    struct stat sb, lsb;
+    if (stat(path, &sb) == 0 || lstat(path, &lsb) == 0) {
+        return 1;
+    }
+    return 0;
+}
+
 static void cmd_list(int json_mode) {
     lock_state();
     susfs_state_t state;
@@ -396,13 +410,8 @@ static void cmd_list(int json_mode) {
         printf("  \"sus_path\": [\n");
         for (int i = 0; i < state.sus_path_count; i++) {
             int active = 0;
-            if (ksu_available) {
-                struct stat sb, lsb;
-                if (stat(state.sus_path[i].path, &sb) == 0 || lstat(state.sus_path[i].path, &lsb) == 0) {
-                    active = 1; // File exists on filesystem and kernel engine is active
-                } else {
-                    active = 0; // File does not exist on filesystem
-                }
+            if (ksu_available && path_exists_on_disk(state.sus_path[i].path)) {
+                active = 1;
             }
             printf("    {\"path\": \"%s\", \"is_loop\": %s, \"source\": \"%s\", \"configured\": true, \"active\": %s}%s\n",
                    state.sus_path[i].path,
@@ -486,18 +495,7 @@ static int cmd_restore(int json_mode) {
 
     // Restore sus_path (Idempotent)
     for (int i = 0; i < state.sus_path_count; i++) {
-        struct stat sb;
-        if (stat(state.sus_path[i].path, &sb) != 0) {
-            // Check if file is already active in kernel susfs table
-            struct st_susfs_sus_path check_info = {0};
-            strncpy(check_info.target_pathname, state.sus_path[i].path, SUSFS_MAX_LEN_PATHNAME - 1);
-            errno = 0;
-            int check_ret = ioctl(fd, CMD_SUSFS_ADD_SUS_PATH, &check_info);
-            if (check_ret == -1 && errno == EEXIST) {
-                restored++; // File is already active in kernel
-                continue;
-            }
-            // Otherwise file is truly missing from filesystem
+        if (!path_exists_on_disk(state.sus_path[i].path)) {
             failed++;
             if (error_count < MAX_ENTRIES) {
                 strncpy(errors[error_count].type, "sus_path", 31);
@@ -507,8 +505,13 @@ static int cmd_restore(int json_mode) {
             }
             continue;
         }
+        struct stat sb;
+        unsigned long target_ino = 0;
+        if (stat(state.sus_path[i].path, &sb) == 0) {
+            target_ino = sb.st_ino;
+        }
         struct st_susfs_sus_path info = {0};
-        info.target_ino = sb.st_ino;
+        info.target_ino = target_ino;
         strncpy(info.target_pathname, state.sus_path[i].path, SUSFS_MAX_LEN_PATHNAME - 1);
         int ret = ioctl(fd, CMD_SUSFS_ADD_SUS_PATH, &info);
         if (ret == 0 || errno == EEXIST) {
