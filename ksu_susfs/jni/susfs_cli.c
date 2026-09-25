@@ -397,22 +397,11 @@ static void cmd_list(int json_mode) {
         for (int i = 0; i < state.sus_path_count; i++) {
             int active = 0;
             if (ksu_available) {
-                struct stat sb;
-                unsigned long target_ino = 0;
-                if (stat(state.sus_path[i].path, &sb) == 0) {
-                    target_ino = sb.st_ino;
-                }
-                struct st_susfs_sus_path info = {0};
-                info.target_ino = target_ino;
-                strncpy(info.target_pathname, state.sus_path[i].path, SUSFS_MAX_LEN_PATHNAME - 1);
-                errno = 0;
-                int ret = ioctl(fd, CMD_SUSFS_ADD_SUS_PATH, &info);
-                if (ret == -1 && errno == EEXIST) {
-                    active = 1; // Explicitly registered in kernel active table
-                } else if (ret == 0 && target_ino > 0) {
-                    active = 1; // Successfully verified active target inode
+                struct stat sb, lsb;
+                if (stat(state.sus_path[i].path, &sb) == 0 || lstat(state.sus_path[i].path, &lsb) == 0) {
+                    active = 1; // File exists on filesystem and kernel engine is active
                 } else {
-                    active = 0; // Missing target path on disk
+                    active = 0; // File does not exist on filesystem
                 }
             }
             printf("    {\"path\": \"%s\", \"is_loop\": %s, \"source\": \"%s\", \"configured\": true, \"active\": %s}%s\n",
