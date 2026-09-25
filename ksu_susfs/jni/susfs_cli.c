@@ -601,7 +601,6 @@ static int cmd_restore(int json_mode) {
 
 static void cmd_auto_hide(const char *subcmd, int json_mode) {
     const char *preset_paths[] = {
-        "/data/adb/modules",
         "/system/bin/su",
         "/system/xbin/su"
     };
