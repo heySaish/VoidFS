@@ -804,6 +804,14 @@ int main(int argc, char *argv[]) {
         struct stat sb;
         if (stat(argv[2], &sb) == 0) {
             info.target_ino = sb.st_ino;
+        } else {
+            int pfd = open(argv[2], O_PATH | O_NOFOLLOW);
+            if (pfd >= 0) {
+                if (fstat(pfd, &sb) == 0) {
+                    info.target_ino = sb.st_ino;
+                }
+                close(pfd);
+            }
         }
         strncpy(info.target_pathname, argv[2], SUSFS_MAX_LEN_PATHNAME - 1);
         int ret = ioctl(fd, CMD_SUSFS_REMOVE_SUS_PATH, &info);
