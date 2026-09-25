@@ -32,7 +32,29 @@ if [ "$MODE" = "pre" ] || [ "$MODE" = "before" ]; then
 
     # 4. Inject a missing path rule into state.json (configured: true, active: false)
     echo "[+] Injecting missing path rule into state.json..."
-    sed -i 's|"sus_path": \[|"sus_path": \[ {\"path\":\"/data/local/tmp/susfs_reboot_test_missing.txt\", \"is_loop\": false, \"source\":\"manual\"},|' "$STATE_FILE"
+    cat << EOF > "$STATE_FILE"
+{
+  "schema": 1,
+  "sus_path": [
+    {
+      "path": "$MISSING_FILE",
+      "is_loop": false,
+      "source": "manual"
+    },
+    {
+      "path": "$TEST_FILE",
+      "is_loop": false,
+      "source": "manual"
+    }
+  ],
+  "sus_mount": [],
+  "try_umount": [],
+  "sus_kstat": [],
+  "set_uname": { "release": "default", "version": "default" },
+  "sus_su": 0,
+  "logging": 0
+}
+EOF
 
     # 5. Take JSON Snapshot
     echo "[+] Taking Pre-Reboot Config Snapshot..."
@@ -57,6 +79,11 @@ elif [ "$MODE" = "post" ] || [ "$MODE" = "after" ]; then
         echo "[-] Error: Pre-reboot snapshot '$SNAPSHOT_FILE' not found!"
         echo "[-] Please run 'pre' mode before rebooting."
         exit 1
+    fi
+
+    # Ensure test file physically exists so it can be restored by kernel
+    if [ ! -f "$TEST_FILE" ]; then
+        touch "$TEST_FILE"
     fi
 
     # 1. Execute Restore Command

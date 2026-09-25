@@ -389,29 +389,30 @@ static void cmd_list(int json_mode) {
 
     int fd = get_ksu_fd_silent();
     int ksu_available = (fd >= 0);
-    if (fd >= 0) close(fd);
 
     if (json_mode) {
         printf("{\n");
         printf("  \"schema\": %d,\n", state.schema);
         printf("  \"sus_path\": [\n");
         for (int i = 0; i < state.sus_path_count; i++) {
-            struct stat sb;
-            int path_stat = stat(state.sus_path[i].path, &sb);
             int active = 0;
             if (ksu_available) {
-                // Check if target file or its direct file inode exists
-                if (path_stat == 0) {
-                    active = 1;
+                struct stat sb;
+                unsigned long target_ino = 0;
+                if (stat(state.sus_path[i].path, &sb) == 0) {
+                    target_ino = sb.st_ino;
+                }
+                struct st_susfs_sus_path info = {0};
+                info.target_ino = target_ino;
+                strncpy(info.target_pathname, state.sus_path[i].path, SUSFS_MAX_LEN_PATHNAME - 1);
+                errno = 0;
+                int ret = ioctl(fd, CMD_SUSFS_ADD_SUS_PATH, &info);
+                if (ret == -1 && errno == EEXIST) {
+                    active = 1; // Explicitly registered in kernel active table
+                } else if (ret == 0 && target_ino > 0) {
+                    active = 1; // Successfully verified active target inode
                 } else {
-                    // Check if file exists via LSTAT or parent directory stat
-                    struct stat lsb;
-                    if (lstat(state.sus_path[i].path, &lsb) == 0) {
-                        active = 1;
-                    } else {
-                        // Target path does not exist on disk at all
-                        active = 0;
-                    }
+                    active = 0; // Missing target path on disk
                 }
             }
             printf("    {\"path\": \"%s\", \"is_loop\": %s, \"source\": \"%s\", \"configured\": true, \"active\": %s}%s\n",
@@ -473,6 +474,7 @@ static void cmd_list(int json_mode) {
             printf("  - %s\n", state.sus_kstat[i].path);
         }
     }
+    if (fd >= 0) close(fd);
 }
 
 static int cmd_restore(int json_mode) {
@@ -496,15 +498,31 @@ static int cmd_restore(int json_mode) {
     // Restore sus_path (Idempotent)
     for (int i = 0; i < state.sus_path_count; i++) {
         struct stat sb;
-        unsigned long target_ino = 0;
-        if (stat(state.sus_path[i].path, &sb) == 0) {
-            target_ino = sb.st_ino;
+        if (stat(state.sus_path[i].path, &sb) != 0) {
+            // Check if file is already active in kernel susfs table
+            struct st_susfs_sus_path check_info = {0};
+            strncpy(check_info.target_pathname, state.sus_path[i].path, SUSFS_MAX_LEN_PATHNAME - 1);
+            errno = 0;
+            int check_ret = ioctl(fd, CMD_SUSFS_ADD_SUS_PATH, &check_info);
+            if (check_ret == -1 && errno == EEXIST) {
+                restored++; // File is already active in kernel
+                continue;
+            }
+            // Otherwise file is truly missing from filesystem
+            failed++;
+            if (error_count < MAX_ENTRIES) {
+                strncpy(errors[error_count].type, "sus_path", 31);
+                strncpy(errors[error_count].path, state.sus_path[i].path, SUSFS_MAX_LEN_PATHNAME - 1);
+                strncpy(errors[error_count].error, "Target path does not exist on filesystem", 63);
+                error_count++;
+            }
+            continue;
         }
         struct st_susfs_sus_path info = {0};
-        info.target_ino = target_ino;
+        info.target_ino = sb.st_ino;
         strncpy(info.target_pathname, state.sus_path[i].path, SUSFS_MAX_LEN_PATHNAME - 1);
         int ret = ioctl(fd, CMD_SUSFS_ADD_SUS_PATH, &info);
-        if (ret == 0 || errno == EEXIST || target_ino == 0) {
+        if (ret == 0 || errno == EEXIST) {
             restored++;
         } else {
             failed++;
