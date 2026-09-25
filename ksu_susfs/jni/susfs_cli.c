@@ -78,6 +78,7 @@ struct st_sus_su {
 typedef struct {
     char path[SUSFS_MAX_LEN_PATHNAME];
     int is_loop;
+    char source[16]; // "manual" or "auto_hide"
 } sus_path_entry_t;
 
 typedef struct {
@@ -113,6 +114,12 @@ typedef struct {
     int logging;
 } susfs_state_t;
 
+typedef struct {
+    char type[32];
+    char path[SUSFS_MAX_LEN_PATHNAME];
+    char error[64];
+} restore_error_t;
+
 static int lock_state_fd = -1;
 
 static void lock_state(void) {
@@ -131,15 +138,24 @@ static void unlock_state(void) {
     }
 }
 
-static int is_protected_path(const char *path) {
+static int is_protected_path(const char *path, int force) {
     if (!path) return 0;
+    // Core infrastructure is strictly protected (hard block even with --force)
     if (!strcmp(path, "/data/adb") ||
         !strcmp(path, "/data/adb/ksu") ||
-        !strcmp(path, "/data/adb/modules") ||
-        !strcmp(path, "/system/bin/su") ||
+        !strcmp(path, "/data/adb/susfs") ||
+        !strcmp(path, "/data/adb/susfs/state.json")) {
+        printf("[-] Error: Core root infrastructure path '%s' is strictly protected (hard block)!\n", path);
+        return 1;
+    }
+    // su binaries require explicit --force flag
+    if (!strcmp(path, "/system/bin/su") ||
         !strcmp(path, "/system/xbin/su") ||
         !strcmp(path, "/sbin/su")) {
-        return 1;
+        if (!force) {
+            printf("[!] Policy Warning: Hiding '%s' requires --force (-f) flag or 'auto_hide enable'.\n", path);
+            return 1;
+        }
     }
     return 0;
 }
@@ -165,12 +181,22 @@ static void load_state(susfs_state_t *state) {
         else if (strstr(line, "\"try_umount\"")) section = 3;
         else if (strstr(line, "\"sus_kstat\"")) section = 4;
 
-        if (section == 1 && strstr(line, "\"path\"")) {
-            char p[SUSFS_MAX_LEN_PATHNAME] = {0};
-            if (sscanf(line, " %*[^:]: \"%255[^\"]\"", p) == 1) {
-                if (state->sus_path_count < MAX_ENTRIES) {
-                    strncpy(state->sus_path[state->sus_path_count].path, p, SUSFS_MAX_LEN_PATHNAME - 1);
-                    state->sus_path_count++;
+        if (section == 1) {
+            if (strstr(line, "\"path\"")) {
+                char p[SUSFS_MAX_LEN_PATHNAME] = {0};
+                if (sscanf(line, " %*[^:]: \"%255[^\"]\"", p) == 1) {
+                    if (state->sus_path_count < MAX_ENTRIES) {
+                        strncpy(state->sus_path[state->sus_path_count].path, p, SUSFS_MAX_LEN_PATHNAME - 1);
+                        strncpy(state->sus_path[state->sus_path_count].source, "manual", 15);
+                        state->sus_path_count++;
+                    }
+                }
+            } else if (strstr(line, "\"source\"")) {
+                char src[16] = {0};
+                if (sscanf(line, " %*[^:]: \"%15[^\"]\"", src) == 1) {
+                    if (state->sus_path_count > 0) {
+                        strncpy(state->sus_path[state->sus_path_count - 1].source, src, 15);
+                    }
                 }
             }
         } else if (section == 2 && strstr(line, "\"path\"")) {
@@ -222,7 +248,8 @@ static void save_state_atomic(const susfs_state_t *state) {
     for (int i = 0; i < state->sus_path_count; i++) {
         fprintf(f, "    {\n");
         fprintf(f, "      \"path\": \"%s\",\n", state->sus_path[i].path);
-        fprintf(f, "      \"is_loop\": %s\n", state->sus_path[i].is_loop ? "true" : "false");
+        fprintf(f, "      \"is_loop\": %s,\n", state->sus_path[i].is_loop ? "true" : "false");
+        fprintf(f, "      \"source\": \"%s\"\n", state->sus_path[i].source[0] ? state->sus_path[i].source : "manual");
         fprintf(f, "    }%s\n", (i == state->sus_path_count - 1) ? "" : ",");
     }
     fprintf(f, "  ],\n");
@@ -360,16 +387,37 @@ static void cmd_list(int json_mode) {
     load_state(&state);
     unlock_state();
 
+    int fd = get_ksu_fd_silent();
+    int ksu_available = (fd >= 0);
+    if (fd >= 0) close(fd);
+
     if (json_mode) {
         printf("{\n");
         printf("  \"schema\": %d,\n", state.schema);
         printf("  \"sus_path\": [\n");
         for (int i = 0; i < state.sus_path_count; i++) {
             struct stat sb;
-            int active = (stat(state.sus_path[i].path, &sb) != 0); // hidden if stat fails or modified
-            printf("    {\"path\": \"%s\", \"is_loop\": %s, \"configured\": true, \"active\": %s}%s\n",
+            int path_stat = stat(state.sus_path[i].path, &sb);
+            int active = 0;
+            if (ksu_available) {
+                // Check if target file or its direct file inode exists
+                if (path_stat == 0) {
+                    active = 1;
+                } else {
+                    // Check if file exists via LSTAT or parent directory stat
+                    struct stat lsb;
+                    if (lstat(state.sus_path[i].path, &lsb) == 0) {
+                        active = 1;
+                    } else {
+                        // Target path does not exist on disk at all
+                        active = 0;
+                    }
+                }
+            }
+            printf("    {\"path\": \"%s\", \"is_loop\": %s, \"source\": \"%s\", \"configured\": true, \"active\": %s}%s\n",
                    state.sus_path[i].path,
                    state.sus_path[i].is_loop ? "true" : "false",
+                   state.sus_path[i].source[0] ? state.sus_path[i].source : "manual",
                    active ? "true" : "false",
                    (i == state.sus_path_count - 1) ? "" : ",");
         }
@@ -377,24 +425,27 @@ static void cmd_list(int json_mode) {
 
         printf("  \"sus_mount\": [\n");
         for (int i = 0; i < state.sus_mount_count; i++) {
-            printf("    {\"path\": \"%s\", \"configured\": true, \"active\": true}%s\n",
+            printf("    {\"path\": \"%s\", \"configured\": true, \"active\": %s}%s\n",
                    state.sus_mount[i].path,
+                   ksu_available ? "true" : "false",
                    (i == state.sus_mount_count - 1) ? "" : ",");
         }
         printf("  ],\n");
 
         printf("  \"try_umount\": [\n");
         for (int i = 0; i < state.try_umount_count; i++) {
-            printf("    {\"path\": \"%s\", \"mode\": %d, \"configured\": true, \"active\": true}%s\n",
+            printf("    {\"path\": \"%s\", \"mode\": %d, \"configured\": true, \"active\": %s}%s\n",
                    state.try_umount[i].path, state.try_umount[i].mode,
+                   ksu_available ? "true" : "false",
                    (i == state.try_umount_count - 1) ? "" : ",");
         }
         printf("  ],\n");
 
         printf("  \"sus_kstat\": [\n");
         for (int i = 0; i < state.sus_kstat_count; i++) {
-            printf("    {\"path\": \"%s\", \"configured\": true, \"active\": true}%s\n",
+            printf("    {\"path\": \"%s\", \"configured\": true, \"active\": %s}%s\n",
                    state.sus_kstat[i].path,
+                   ksu_available ? "true" : "false",
                    (i == state.sus_kstat_count - 1) ? "" : ",");
         }
         printf("  ]\n");
@@ -404,7 +455,10 @@ static void cmd_list(int json_mode) {
         printf("Schema: %d\n", state.schema);
         printf("\n[ SUS Path ] (%d entries)\n", state.sus_path_count);
         for (int i = 0; i < state.sus_path_count; i++) {
-            printf("  - %s (loop: %s)\n", state.sus_path[i].path, state.sus_path[i].is_loop ? "yes" : "no");
+            printf("  - %s (loop: %s, source: %s)\n",
+                   state.sus_path[i].path,
+                   state.sus_path[i].is_loop ? "yes" : "no",
+                   state.sus_path[i].source[0] ? state.sus_path[i].source : "manual");
         }
         printf("\n[ SUS Mount ] (%d entries)\n", state.sus_mount_count);
         for (int i = 0; i < state.sus_mount_count; i++) {
@@ -429,13 +483,15 @@ static int cmd_restore(int json_mode) {
     int fd = get_ksu_fd_silent();
     if (fd < 0) {
         unlock_state();
-        if (json_mode) printf("{\"restored\":0,\"failed\":1,\"errors\":[{\"type\":\"kernel\",\"error\":\"Failed root supercall\"}]}\n");
+        if (json_mode) printf("{\"restored\":0,\"failed\":1,\"errors\":[{\"type\":\"kernel\",\"path\":\"/\",\"error\":\"Failed root supercall\"}]}\n");
         else printf("[-] Error: Root supercall failed during restore.\n");
         return 1;
     }
 
     int restored = 0;
     int failed = 0;
+    restore_error_t errors[MAX_ENTRIES];
+    int error_count = 0;
 
     // Restore sus_path (Idempotent)
     for (int i = 0; i < state.sus_path_count; i++) {
@@ -452,6 +508,12 @@ static int cmd_restore(int json_mode) {
             restored++;
         } else {
             failed++;
+            if (error_count < MAX_ENTRIES) {
+                strncpy(errors[error_count].type, "sus_path", 31);
+                strncpy(errors[error_count].path, state.sus_path[i].path, SUSFS_MAX_LEN_PATHNAME - 1);
+                strncpy(errors[error_count].error, strerror(errno), 63);
+                error_count++;
+            }
         }
     }
 
@@ -464,6 +526,12 @@ static int cmd_restore(int json_mode) {
             restored++;
         } else {
             failed++;
+            if (error_count < MAX_ENTRIES) {
+                strncpy(errors[error_count].type, "sus_mount", 31);
+                strncpy(errors[error_count].path, state.sus_mount[i].path, SUSFS_MAX_LEN_PATHNAME - 1);
+                strncpy(errors[error_count].error, strerror(errno), 63);
+                error_count++;
+            }
         }
     }
 
@@ -477,6 +545,12 @@ static int cmd_restore(int json_mode) {
             restored++;
         } else {
             failed++;
+            if (error_count < MAX_ENTRIES) {
+                strncpy(errors[error_count].type, "try_umount", 31);
+                strncpy(errors[error_count].path, state.try_umount[i].path, SUSFS_MAX_LEN_PATHNAME - 1);
+                strncpy(errors[error_count].error, strerror(errno), 63);
+                error_count++;
+            }
         }
     }
 
@@ -494,12 +568,109 @@ static int cmd_restore(int json_mode) {
     unlock_state();
 
     if (json_mode) {
-        printf("{\"restored\":%d,\"failed\":%d}\n", restored, failed);
+        printf("{\n");
+        printf("  \"restored\": %d,\n", restored);
+        printf("  \"failed\": %d,\n", failed);
+        printf("  \"errors\": [\n");
+        for (int i = 0; i < error_count; i++) {
+            printf("    {\"type\": \"%s\", \"path\": \"%s\", \"error\": \"%s\"}%s\n",
+                   errors[i].type, errors[i].path, errors[i].error,
+                   (i == error_count - 1) ? "" : ",");
+        }
+        printf("  ]\n");
+        printf("}\n");
     } else {
         printf("[+] Boot Restore Complete: %d rules restored, %d failed.\n", restored, failed);
+        for (int i = 0; i < error_count; i++) {
+            printf("  [-] Failed [%s] %s: %s\n", errors[i].type, errors[i].path, errors[i].error);
+        }
     }
 
     return (failed > 0) ? 1 : 0;
+}
+
+static void cmd_auto_hide(const char *subcmd, int json_mode) {
+    const char *preset_paths[] = {
+        "/data/adb/modules",
+        "/system/bin/su",
+        "/system/xbin/su"
+    };
+    int num_presets = sizeof(preset_paths) / sizeof(preset_paths[0]);
+
+    if (!subcmd || !strcmp(subcmd, "status")) {
+        lock_state();
+        susfs_state_t state;
+        load_state(&state);
+        unlock_state();
+
+        int enabled_count = 0;
+        for (int i = 0; i < num_presets; i++) {
+            for (int j = 0; j < state.sus_path_count; j++) {
+                if (!strcmp(state.sus_path[j].path, preset_paths[i])) {
+                    enabled_count++;
+                    break;
+                }
+            }
+        }
+        int is_enabled = (enabled_count == num_presets);
+        if (json_mode) {
+            printf("{\"auto_hide\":\"%s\", \"preset_count\":%d, \"active_count\":%d}\n",
+                   is_enabled ? "enabled" : (enabled_count > 0 ? "partial" : "disabled"),
+                   num_presets, enabled_count);
+        } else {
+            printf("Auto-Hide Status: %s (%d/%d preset paths configured)\n",
+                   is_enabled ? "ENABLED" : (enabled_count > 0 ? "PARTIAL" : "DISABLED"),
+                   enabled_count, num_presets);
+        }
+    } else if (!strcmp(subcmd, "enable")) {
+        printf("[+] Enabling Auto-Hide Presets...\n");
+        for (int i = 0; i < num_presets; i++) {
+            struct stat sb;
+            if (stat(preset_paths[i], &sb) == 0) {
+                char cmd[512];
+                snprintf(cmd, sizeof(cmd), "susfs add_sus_path %s --force --source=auto_hide", preset_paths[i]);
+                system(cmd);
+            }
+        }
+    } else if (!strcmp(subcmd, "disable")) {
+        printf("[+] Disabling Auto-Hide Presets (removing auto_hide tagged entries only)...\n");
+        lock_state();
+        susfs_state_t state;
+        load_state(&state);
+
+        int fd = get_ksu_fd_silent();
+        int new_count = 0;
+        sus_path_entry_t new_entries[MAX_ENTRIES];
+
+        for (int i = 0; i < state.sus_path_count; i++) {
+            int is_preset = 0;
+            for (int p = 0; p < num_presets; p++) {
+                if (!strcmp(state.sus_path[i].path, preset_paths[p])) {
+                    is_preset = 1;
+                    break;
+                }
+            }
+            if (is_preset && !strcmp(state.sus_path[i].source, "auto_hide")) {
+                if (fd >= 0) {
+                    struct st_susfs_sus_path info = {0};
+                    struct stat sb;
+                    if (stat(state.sus_path[i].path, &sb) == 0) info.target_ino = sb.st_ino;
+                    strncpy(info.target_pathname, state.sus_path[i].path, SUSFS_MAX_LEN_PATHNAME - 1);
+                    ioctl(fd, CMD_SUSFS_REMOVE_SUS_PATH, &info);
+                }
+                printf("[+] Auto-hide preset removed: %s\n", state.sus_path[i].path);
+            } else {
+                new_entries[new_count++] = state.sus_path[i];
+            }
+        }
+        if (fd >= 0) close(fd);
+        memcpy(state.sus_path, new_entries, sizeof(sus_path_entry_t) * new_count);
+        state.sus_path_count = new_count;
+        save_state_atomic(&state);
+        unlock_state();
+    } else {
+        printf("Usage: susfs auto_hide <status|enable|disable>\n");
+    }
 }
 
 static void print_help(void) {
@@ -507,7 +678,7 @@ static void print_help(void) {
     printf("Usage: susfs <command> [args]\n\n");
     printf("Commands:\n");
     printf("  show version                 Show SUSFS kernel engine version\n");
-    printf("  add_sus_path <path>          Hide file/directory from non-root app processes\n");
+    printf("  add_sus_path <path> [--force] Hide file/directory from non-root app processes\n");
     printf("  remove_sus_path <path>       Remove hidden file/directory from sus_path list\n");
     printf("  add_sus_mount <mount_path>   Hide mountpoint from /proc/self/mountinfo\n");
     printf("  add_try_umount <path> [mode] Umount mountpoint for non-root UIDs\n");
@@ -518,7 +689,7 @@ static void print_help(void) {
     printf("  status [--json]              Check live SUSFS kernel engine status\n");
     printf("  list [--json]                List all persistently configured SUSFS rules\n");
     printf("  restore [--json]             Restore all persistent rules on boot/demand\n");
-    printf("  auto_hide                    1-Click hide default root & module paths\n");
+    printf("  auto_hide <status|enable|disable> 1-Click auto hide preset management\n");
 }
 
 int main(int argc, char *argv[]) {
@@ -528,10 +699,13 @@ int main(int argc, char *argv[]) {
     }
 
     int json_mode = 0;
+    int force_flag = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--json") || !strcmp(argv[i], "-j")) {
             json_mode = 1;
-            break;
+        }
+        if (!strcmp(argv[i], "--force") || !strcmp(argv[i], "-f")) {
+            force_flag = 1;
         }
     }
 
@@ -553,12 +727,32 @@ int main(int argc, char *argv[]) {
         }
         close(fd);
     } else if (!strcmp(argv[1], "add_sus_path") && argc >= 3) {
-        if (is_protected_path(argv[2])) {
-            printf("[-] Error: Critical root system path '%s' is protected and cannot be hidden!\n", argv[2]);
+        if (is_protected_path(argv[2], force_flag)) {
             return 1;
+        }
+        char src_tag[16] = "manual";
+        for (int i = 3; i < argc; i++) {
+            if (!strncmp(argv[i], "--source=", 9)) {
+                strncpy(src_tag, argv[i] + 9, 15);
+            }
         }
         struct stat sb;
         if (stat(argv[2], &sb) != 0) {
+            lock_state();
+            susfs_state_t state;
+            load_state(&state);
+            int exists = 0;
+            for (int i = 0; i < state.sus_path_count; i++) {
+                if (!strcmp(state.sus_path[i].path, argv[2])) {
+                    exists = 1;
+                    break;
+                }
+            }
+            unlock_state();
+            if (exists) {
+                printf("[!] Already configured in state: %s\n", argv[2]);
+                return 0;
+            }
             printf("[-] Error: Target path '%s' does not exist.\n", argv[2]);
             return 1;
         }
@@ -583,9 +777,10 @@ int main(int argc, char *argv[]) {
             if (!exists && state.sus_path_count < MAX_ENTRIES) {
                 strncpy(state.sus_path[state.sus_path_count].path, argv[2], SUSFS_MAX_LEN_PATHNAME - 1);
                 state.sus_path[state.sus_path_count].is_loop = 0;
+                strncpy(state.sus_path[state.sus_path_count].source, src_tag, 15);
                 state.sus_path_count++;
                 save_state_atomic(&state);
-                printf("[+] Successfully added SUS Path (ino: %lu): %s\n", (unsigned long)sb.st_ino, argv[2]);
+                printf("[+] Successfully added SUS Path (ino: %lu, source: %s): %s\n", (unsigned long)sb.st_ino, src_tag, argv[2]);
             } else {
                 printf("[!] Already configured in state: %s\n", argv[2]);
             }
@@ -626,8 +821,7 @@ int main(int argc, char *argv[]) {
             return 1;
         }
     } else if (!strcmp(argv[1], "add_sus_mount") && argc >= 3) {
-        if (is_protected_path(argv[2])) {
-            printf("[-] Error: Critical path '%s' is protected!\n", argv[2]);
+        if (is_protected_path(argv[2], force_flag)) {
             return 1;
         }
         int fd = get_ksu_fd();
@@ -794,22 +988,8 @@ int main(int argc, char *argv[]) {
     } else if (!strcmp(argv[1], "restore")) {
         return cmd_restore(json_mode);
     } else if (!strcmp(argv[1], "auto_hide")) {
-        printf("[+] Running 1-Click Auto Hide...\n");
-        const char *preset_paths[] = {
-            "/data/adb/modules",
-            "/data/adb/ksu",
-            "/system/bin/su",
-            "/system/xbin/su"
-        };
-        int num_presets = sizeof(preset_paths) / sizeof(preset_paths[0]);
-        for (int i = 0; i < num_presets; i++) {
-            struct stat sb;
-            if (stat(preset_paths[i], &sb) == 0) {
-                char cmd[512];
-                snprintf(cmd, sizeof(cmd), "%s add_sus_path %s", argv[0], preset_paths[i]);
-                system(cmd);
-            }
-        }
+        const char *subcmd = (argc >= 3) ? argv[2] : "status";
+        cmd_auto_hide(subcmd, json_mode);
     } else if (!strcmp(argv[1], "status") || json_mode) {
         if (json_mode) {
             print_status_json();
