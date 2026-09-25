@@ -9,6 +9,7 @@
 #include <sys/types.h>
 #include <sys/syscall.h>
 #include <sys/utsname.h>
+#include <sys/file.h>
 
 #define KSU_MAGIC1 0xDEADBEEF
 #define KSU_MAGIC2 0xCAFEBABE
@@ -26,6 +27,12 @@
 #define CMD_SUSFS_SUS_SU           0x60000
 
 #define SUSFS_MAX_LEN_PATHNAME 256
+#define SUSFS_STATE_DIR "/data/adb/susfs"
+#define SUSFS_STATE_FILE "/data/adb/susfs/state.json"
+#define SUSFS_STATE_TMP "/data/adb/susfs/state.json.tmp"
+#define SUSFS_STATE_LOCK "/data/adb/susfs/state.lock"
+#define SUSFS_SCHEMA_VERSION 1
+#define MAX_ENTRIES 128
 
 struct st_susfs_sus_path {
     unsigned long target_ino;
@@ -34,6 +41,11 @@ struct st_susfs_sus_path {
 
 struct st_susfs_sus_mount {
     char target_pathname[SUSFS_MAX_LEN_PATHNAME];
+};
+
+struct st_susfs_try_umount {
+    char target_pathname[SUSFS_MAX_LEN_PATHNAME];
+    int mnt_mode;
 };
 
 struct st_susfs_sus_kstat {
@@ -58,6 +70,206 @@ struct st_susfs_uname {
     char release[65];
     char version[65];
 };
+
+struct st_sus_su {
+    int enabled;
+};
+
+typedef struct {
+    char path[SUSFS_MAX_LEN_PATHNAME];
+    int is_loop;
+} sus_path_entry_t;
+
+typedef struct {
+    char path[SUSFS_MAX_LEN_PATHNAME];
+} sus_mount_entry_t;
+
+typedef struct {
+    char path[SUSFS_MAX_LEN_PATHNAME];
+    int mode;
+} try_umount_entry_t;
+
+typedef struct {
+    char path[SUSFS_MAX_LEN_PATHNAME];
+} sus_kstat_entry_t;
+
+typedef struct {
+    int schema;
+    sus_path_entry_t sus_path[MAX_ENTRIES];
+    int sus_path_count;
+
+    sus_mount_entry_t sus_mount[MAX_ENTRIES];
+    int sus_mount_count;
+
+    try_umount_entry_t try_umount[MAX_ENTRIES];
+    int try_umount_count;
+
+    sus_kstat_entry_t sus_kstat[MAX_ENTRIES];
+    int sus_kstat_count;
+
+    char uname_release[65];
+    char uname_version[65];
+    int sus_su;
+    int logging;
+} susfs_state_t;
+
+static int lock_state_fd = -1;
+
+static void lock_state(void) {
+    mkdir(SUSFS_STATE_DIR, 0700);
+    lock_state_fd = open(SUSFS_STATE_LOCK, O_RDWR | O_CREAT, 0600);
+    if (lock_state_fd >= 0) {
+        flock(lock_state_fd, LOCK_EX);
+    }
+}
+
+static void unlock_state(void) {
+    if (lock_state_fd >= 0) {
+        flock(lock_state_fd, LOCK_UN);
+        close(lock_state_fd);
+        lock_state_fd = -1;
+    }
+}
+
+static int is_protected_path(const char *path) {
+    if (!path) return 0;
+    if (!strcmp(path, "/data/adb") ||
+        !strcmp(path, "/data/adb/ksu") ||
+        !strcmp(path, "/data/adb/modules") ||
+        !strcmp(path, "/system/bin/su") ||
+        !strcmp(path, "/system/xbin/su") ||
+        !strcmp(path, "/sbin/su")) {
+        return 1;
+    }
+    return 0;
+}
+
+static void init_default_state(susfs_state_t *state) {
+    memset(state, 0, sizeof(susfs_state_t));
+    state->schema = SUSFS_SCHEMA_VERSION;
+    snprintf(state->uname_release, sizeof(state->uname_release), "default");
+    snprintf(state->uname_version, sizeof(state->uname_version), "default");
+}
+
+static void load_state(susfs_state_t *state) {
+    init_default_state(state);
+    FILE *f = fopen(SUSFS_STATE_FILE, "r");
+    if (!f) return;
+
+    char line[512];
+    int section = 0; // 1: sus_path, 2: sus_mount, 3: try_umount, 4: sus_kstat
+
+    while (fgets(line, sizeof(line), f)) {
+        if (strstr(line, "\"sus_path\"")) section = 1;
+        else if (strstr(line, "\"sus_mount\"")) section = 2;
+        else if (strstr(line, "\"try_umount\"")) section = 3;
+        else if (strstr(line, "\"sus_kstat\"")) section = 4;
+
+        if (section == 1 && strstr(line, "\"path\"")) {
+            char p[SUSFS_MAX_LEN_PATHNAME] = {0};
+            if (sscanf(line, " %*[^:]: \"%255[^\"]\"", p) == 1) {
+                if (state->sus_path_count < MAX_ENTRIES) {
+                    strncpy(state->sus_path[state->sus_path_count].path, p, SUSFS_MAX_LEN_PATHNAME - 1);
+                    state->sus_path_count++;
+                }
+            }
+        } else if (section == 2 && strstr(line, "\"path\"")) {
+            char p[SUSFS_MAX_LEN_PATHNAME] = {0};
+            if (sscanf(line, " %*[^:]: \"%255[^\"]\"", p) == 1) {
+                if (state->sus_mount_count < MAX_ENTRIES) {
+                    strncpy(state->sus_mount[state->sus_mount_count].path, p, SUSFS_MAX_LEN_PATHNAME - 1);
+                    state->sus_mount_count++;
+                }
+            }
+        } else if (section == 3 && strstr(line, "\"path\"")) {
+            char p[SUSFS_MAX_LEN_PATHNAME] = {0};
+            if (sscanf(line, " %*[^:]: \"%255[^\"]\"", p) == 1) {
+                if (state->try_umount_count < MAX_ENTRIES) {
+                    strncpy(state->try_umount[state->try_umount_count].path, p, SUSFS_MAX_LEN_PATHNAME - 1);
+                    state->try_umount[state->try_umount_count].mode = 0;
+                    state->try_umount_count++;
+                }
+            }
+        } else if (section == 4 && strstr(line, "\"path\"")) {
+            char p[SUSFS_MAX_LEN_PATHNAME] = {0};
+            if (sscanf(line, " %*[^:]: \"%255[^\"]\"", p) == 1) {
+                if (state->sus_kstat_count < MAX_ENTRIES) {
+                    strncpy(state->sus_kstat[state->sus_kstat_count].path, p, SUSFS_MAX_LEN_PATHNAME - 1);
+                    state->sus_kstat_count++;
+                }
+            }
+        }
+    }
+    fclose(f);
+}
+
+static void save_state_atomic(const susfs_state_t *state) {
+    mkdir(SUSFS_STATE_DIR, 0700);
+    int fd = open(SUSFS_STATE_TMP, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) return;
+
+    FILE *f = fdopen(fd, "w");
+    if (!f) {
+        close(fd);
+        return;
+    }
+
+    fprintf(f, "{\n");
+    fprintf(f, "  \"schema\": %d,\n", state->schema);
+
+    // sus_path
+    fprintf(f, "  \"sus_path\": [\n");
+    for (int i = 0; i < state->sus_path_count; i++) {
+        fprintf(f, "    {\n");
+        fprintf(f, "      \"path\": \"%s\",\n", state->sus_path[i].path);
+        fprintf(f, "      \"is_loop\": %s\n", state->sus_path[i].is_loop ? "true" : "false");
+        fprintf(f, "    }%s\n", (i == state->sus_path_count - 1) ? "" : ",");
+    }
+    fprintf(f, "  ],\n");
+
+    // sus_mount
+    fprintf(f, "  \"sus_mount\": [\n");
+    for (int i = 0; i < state->sus_mount_count; i++) {
+        fprintf(f, "    {\n");
+        fprintf(f, "      \"path\": \"%s\"\n", state->sus_mount[i].path);
+        fprintf(f, "    }%s\n", (i == state->sus_mount_count - 1) ? "" : ",");
+    }
+    fprintf(f, "  ],\n");
+
+    // try_umount
+    fprintf(f, "  \"try_umount\": [\n");
+    for (int i = 0; i < state->try_umount_count; i++) {
+        fprintf(f, "    {\n");
+        fprintf(f, "      \"path\": \"%s\",\n", state->try_umount[i].path);
+        fprintf(f, "      \"mode\": %d\n", state->try_umount[i].mode);
+        fprintf(f, "    }%s\n", (i == state->try_umount_count - 1) ? "" : ",");
+    }
+    fprintf(f, "  ],\n");
+
+    // sus_kstat
+    fprintf(f, "  \"sus_kstat\": [\n");
+    for (int i = 0; i < state->sus_kstat_count; i++) {
+        fprintf(f, "    {\n");
+        fprintf(f, "      \"path\": \"%s\"\n", state->sus_kstat[i].path);
+        fprintf(f, "    }%s\n", (i == state->sus_kstat_count - 1) ? "" : ",");
+    }
+    fprintf(f, "  ],\n");
+
+    // uname & settings
+    fprintf(f, "  \"set_uname\": {\n");
+    fprintf(f, "    \"release\": \"%s\",\n", state->uname_release);
+    fprintf(f, "    \"version\": \"%s\"\n", state->uname_version);
+    fprintf(f, "  },\n");
+    fprintf(f, "  \"sus_su\": %d,\n", state->sus_su);
+    fprintf(f, "  \"logging\": %d\n", state->logging);
+    fprintf(f, "}\n");
+
+    fflush(f);
+    fsync(fileno(f));
+    fclose(f);
+
+    rename(SUSFS_STATE_TMP, SUSFS_STATE_FILE);
+}
 
 static int get_ksu_fd_silent(void) {
     if (getuid() != 0) {
@@ -90,8 +302,6 @@ static int check_feature(int fd, unsigned long cmd) {
     if (fd < 0) return 0;
     errno = 0;
     int ret = ioctl(fd, cmd, NULL);
-    // If command is unsupported or unhandled by kernel, ioctl returns -1 with errno == ENOTTY (25)
-    // If command is handled, ret is >= 0 or errno is EFAULT/EINVAL (anything other than ENOTTY)
     if (ret != -1 || errno != ENOTTY) {
         return 1;
     }
@@ -144,6 +354,154 @@ static void print_status_json(void) {
     printf("}\n");
 }
 
+static void cmd_list(int json_mode) {
+    lock_state();
+    susfs_state_t state;
+    load_state(&state);
+    unlock_state();
+
+    if (json_mode) {
+        printf("{\n");
+        printf("  \"schema\": %d,\n", state.schema);
+        printf("  \"sus_path\": [\n");
+        for (int i = 0; i < state.sus_path_count; i++) {
+            struct stat sb;
+            int active = (stat(state.sus_path[i].path, &sb) != 0); // hidden if stat fails or modified
+            printf("    {\"path\": \"%s\", \"is_loop\": %s, \"configured\": true, \"active\": %s}%s\n",
+                   state.sus_path[i].path,
+                   state.sus_path[i].is_loop ? "true" : "false",
+                   active ? "true" : "false",
+                   (i == state.sus_path_count - 1) ? "" : ",");
+        }
+        printf("  ],\n");
+
+        printf("  \"sus_mount\": [\n");
+        for (int i = 0; i < state.sus_mount_count; i++) {
+            printf("    {\"path\": \"%s\", \"configured\": true, \"active\": true}%s\n",
+                   state.sus_mount[i].path,
+                   (i == state.sus_mount_count - 1) ? "" : ",");
+        }
+        printf("  ],\n");
+
+        printf("  \"try_umount\": [\n");
+        for (int i = 0; i < state.try_umount_count; i++) {
+            printf("    {\"path\": \"%s\", \"mode\": %d, \"configured\": true, \"active\": true}%s\n",
+                   state.try_umount[i].path, state.try_umount[i].mode,
+                   (i == state.try_umount_count - 1) ? "" : ",");
+        }
+        printf("  ],\n");
+
+        printf("  \"sus_kstat\": [\n");
+        for (int i = 0; i < state.sus_kstat_count; i++) {
+            printf("    {\"path\": \"%s\", \"configured\": true, \"active\": true}%s\n",
+                   state.sus_kstat[i].path,
+                   (i == state.sus_kstat_count - 1) ? "" : ",");
+        }
+        printf("  ]\n");
+        printf("}\n");
+    } else {
+        printf("=== Active SUSFS Configured Rules ===\n");
+        printf("Schema: %d\n", state.schema);
+        printf("\n[ SUS Path ] (%d entries)\n", state.sus_path_count);
+        for (int i = 0; i < state.sus_path_count; i++) {
+            printf("  - %s (loop: %s)\n", state.sus_path[i].path, state.sus_path[i].is_loop ? "yes" : "no");
+        }
+        printf("\n[ SUS Mount ] (%d entries)\n", state.sus_mount_count);
+        for (int i = 0; i < state.sus_mount_count; i++) {
+            printf("  - %s\n", state.sus_mount[i].path);
+        }
+        printf("\n[ Try Umount ] (%d entries)\n", state.try_umount_count);
+        for (int i = 0; i < state.try_umount_count; i++) {
+            printf("  - %s (mode: %d)\n", state.try_umount[i].path, state.try_umount[i].mode);
+        }
+        printf("\n[ SUS Kstat ] (%d entries)\n", state.sus_kstat_count);
+        for (int i = 0; i < state.sus_kstat_count; i++) {
+            printf("  - %s\n", state.sus_kstat[i].path);
+        }
+    }
+}
+
+static int cmd_restore(int json_mode) {
+    lock_state();
+    susfs_state_t state;
+    load_state(&state);
+
+    int fd = get_ksu_fd_silent();
+    if (fd < 0) {
+        unlock_state();
+        if (json_mode) printf("{\"restored\":0,\"failed\":1,\"errors\":[{\"type\":\"kernel\",\"error\":\"Failed root supercall\"}]}\n");
+        else printf("[-] Error: Root supercall failed during restore.\n");
+        return 1;
+    }
+
+    int restored = 0;
+    int failed = 0;
+
+    // Restore sus_path (Idempotent)
+    for (int i = 0; i < state.sus_path_count; i++) {
+        struct stat sb;
+        unsigned long target_ino = 0;
+        if (stat(state.sus_path[i].path, &sb) == 0) {
+            target_ino = sb.st_ino;
+        }
+        struct st_susfs_sus_path info = {0};
+        info.target_ino = target_ino;
+        strncpy(info.target_pathname, state.sus_path[i].path, SUSFS_MAX_LEN_PATHNAME - 1);
+        int ret = ioctl(fd, CMD_SUSFS_ADD_SUS_PATH, &info);
+        if (ret == 0 || errno == EEXIST || target_ino == 0) {
+            restored++;
+        } else {
+            failed++;
+        }
+    }
+
+    // Restore sus_mount (Idempotent)
+    for (int i = 0; i < state.sus_mount_count; i++) {
+        struct st_susfs_sus_mount info = {0};
+        strncpy(info.target_pathname, state.sus_mount[i].path, SUSFS_MAX_LEN_PATHNAME - 1);
+        int ret = ioctl(fd, CMD_SUSFS_ADD_SUS_MOUNT, &info);
+        if (ret == 0 || errno == EEXIST) {
+            restored++;
+        } else {
+            failed++;
+        }
+    }
+
+    // Restore try_umount (Idempotent)
+    for (int i = 0; i < state.try_umount_count; i++) {
+        struct st_susfs_try_umount info = {0};
+        strncpy(info.target_pathname, state.try_umount[i].path, SUSFS_MAX_LEN_PATHNAME - 1);
+        info.mnt_mode = state.try_umount[i].mode;
+        int ret = ioctl(fd, CMD_SUSFS_ADD_TRY_UMOUNT, &info);
+        if (ret == 0 || errno == EEXIST) {
+            restored++;
+        } else {
+            failed++;
+        }
+    }
+
+    // Restore uname
+    if (strcmp(state.uname_release, "default") || strcmp(state.uname_version, "default")) {
+        struct st_susfs_uname info = {0};
+        strncpy(info.release, state.uname_release, 64);
+        strncpy(info.version, state.uname_version, 64);
+        if (ioctl(fd, CMD_SUSFS_SET_UNAME, &info) == 0) {
+            restored++;
+        }
+    }
+
+    close(fd);
+    unlock_state();
+
+    if (json_mode) {
+        printf("{\"restored\":%d,\"failed\":%d}\n", restored, failed);
+    } else {
+        printf("[+] Boot Restore Complete: %d rules restored, %d failed.\n", restored, failed);
+    }
+
+    return (failed > 0) ? 1 : 0;
+}
+
 static void print_help(void) {
     printf("VoidSU Standalone SUSFS CLI Tool v1.4.2 (Native ARM64)\n");
     printf("Usage: susfs <command> [args]\n\n");
@@ -152,10 +510,15 @@ static void print_help(void) {
     printf("  add_sus_path <path>          Hide file/directory from non-root app processes\n");
     printf("  remove_sus_path <path>       Remove hidden file/directory from sus_path list\n");
     printf("  add_sus_mount <mount_path>   Hide mountpoint from /proc/self/mountinfo\n");
+    printf("  add_try_umount <path> [mode] Umount mountpoint for non-root UIDs\n");
     printf("  add_sus_kstat <path>         Spoof kstat attributes for target path\n");
     printf("  set_uname <release> <ver>    Spoof kernel release and version strings\n");
+    printf("  sus_su <0|1>                 Enable/disable su binary hiding from non-root\n");
     printf("  enable_log <0|1>             Enable (1) or disable (0) kernel debug logging\n");
-    printf("  status [--json]              Check live SUSFS kernel engine status (JSON support)\n");
+    printf("  status [--json]              Check live SUSFS kernel engine status\n");
+    printf("  list [--json]                List all persistently configured SUSFS rules\n");
+    printf("  restore [--json]             Restore all persistent rules on boot/demand\n");
+    printf("  auto_hide                    1-Click hide default root & module paths\n");
 }
 
 int main(int argc, char *argv[]) {
@@ -164,7 +527,6 @@ int main(int argc, char *argv[]) {
         return 0;
     }
 
-    // Support flags like `susfs --json status` or `susfs status --json`
     int json_mode = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--json") || !strcmp(argv[i], "-j")) {
@@ -191,6 +553,10 @@ int main(int argc, char *argv[]) {
         }
         close(fd);
     } else if (!strcmp(argv[1], "add_sus_path") && argc >= 3) {
+        if (is_protected_path(argv[2])) {
+            printf("[-] Error: Critical root system path '%s' is protected and cannot be hidden!\n", argv[2]);
+            return 1;
+        }
         struct stat sb;
         if (stat(argv[2], &sb) != 0) {
             printf("[-] Error: Target path '%s' does not exist.\n", argv[2]);
@@ -201,12 +567,33 @@ int main(int argc, char *argv[]) {
         info.target_ino = sb.st_ino;
         strncpy(info.target_pathname, argv[2], SUSFS_MAX_LEN_PATHNAME - 1);
         int ret = ioctl(fd, CMD_SUSFS_ADD_SUS_PATH, &info);
+        close(fd);
+
         if (ret == 0) {
-            printf("[+] Successfully added SUS Path (ino: %lu): %s\n", (unsigned long)sb.st_ino, argv[2]);
+            lock_state();
+            susfs_state_t state;
+            load_state(&state);
+            int exists = 0;
+            for (int i = 0; i < state.sus_path_count; i++) {
+                if (!strcmp(state.sus_path[i].path, argv[2])) {
+                    exists = 1;
+                    break;
+                }
+            }
+            if (!exists && state.sus_path_count < MAX_ENTRIES) {
+                strncpy(state.sus_path[state.sus_path_count].path, argv[2], SUSFS_MAX_LEN_PATHNAME - 1);
+                state.sus_path[state.sus_path_count].is_loop = 0;
+                state.sus_path_count++;
+                save_state_atomic(&state);
+                printf("[+] Successfully added SUS Path (ino: %lu): %s\n", (unsigned long)sb.st_ino, argv[2]);
+            } else {
+                printf("[!] Already configured in state: %s\n", argv[2]);
+            }
+            unlock_state();
         } else {
             printf("[-] Failed adding SUS Path (ret: %d)\n", ret);
+            return 1;
         }
-        close(fd);
     } else if (!strcmp(argv[1], "remove_sus_path") && argc >= 3) {
         int fd = get_ksu_fd();
         struct st_susfs_sus_path info = {0};
@@ -216,23 +603,117 @@ int main(int argc, char *argv[]) {
         }
         strncpy(info.target_pathname, argv[2], SUSFS_MAX_LEN_PATHNAME - 1);
         int ret = ioctl(fd, CMD_SUSFS_REMOVE_SUS_PATH, &info);
+        close(fd);
+
         if (ret == 0) {
+            lock_state();
+            susfs_state_t state;
+            load_state(&state);
+            int new_count = 0;
+            sus_path_entry_t new_entries[MAX_ENTRIES];
+            for (int i = 0; i < state.sus_path_count; i++) {
+                if (strcmp(state.sus_path[i].path, argv[2])) {
+                    new_entries[new_count++] = state.sus_path[i];
+                }
+            }
+            memcpy(state.sus_path, new_entries, sizeof(sus_path_entry_t) * new_count);
+            state.sus_path_count = new_count;
+            save_state_atomic(&state);
+            unlock_state();
             printf("[+] Successfully removed SUS Path: %s\n", argv[2]);
         } else {
             printf("[-] Failed removing SUS Path (ret: %d)\n", ret);
+            return 1;
         }
-        close(fd);
     } else if (!strcmp(argv[1], "add_sus_mount") && argc >= 3) {
+        if (is_protected_path(argv[2])) {
+            printf("[-] Error: Critical path '%s' is protected!\n", argv[2]);
+            return 1;
+        }
         int fd = get_ksu_fd();
         struct st_susfs_sus_mount info = {0};
         strncpy(info.target_pathname, argv[2], SUSFS_MAX_LEN_PATHNAME - 1);
         int ret = ioctl(fd, CMD_SUSFS_ADD_SUS_MOUNT, &info);
+        close(fd);
+
         if (ret == 0) {
-            printf("[+] Successfully added SUS Mount: %s\n", argv[2]);
+            lock_state();
+            susfs_state_t state;
+            load_state(&state);
+            int exists = 0;
+            for (int i = 0; i < state.sus_mount_count; i++) {
+                if (!strcmp(state.sus_mount[i].path, argv[2])) {
+                    exists = 1;
+                    break;
+                }
+            }
+            if (!exists && state.sus_mount_count < MAX_ENTRIES) {
+                strncpy(state.sus_mount[state.sus_mount_count].path, argv[2], SUSFS_MAX_LEN_PATHNAME - 1);
+                state.sus_mount_count++;
+                save_state_atomic(&state);
+                printf("[+] Successfully added SUS Mount: %s\n", argv[2]);
+            } else {
+                printf("[!] Already configured in state: %s\n", argv[2]);
+            }
+            unlock_state();
         } else {
             printf("[-] Failed adding SUS Mount (ret: %d)\n", ret);
+            return 1;
         }
+    } else if (!strcmp(argv[1], "add_try_umount") && argc >= 3) {
+        int mode = (argc >= 4) ? atoi(argv[3]) : 0;
+        int fd = get_ksu_fd();
+        struct st_susfs_try_umount info = {0};
+        strncpy(info.target_pathname, argv[2], SUSFS_MAX_LEN_PATHNAME - 1);
+        info.mnt_mode = mode;
+        int ret = ioctl(fd, CMD_SUSFS_ADD_TRY_UMOUNT, &info);
         close(fd);
+
+        if (ret == 0) {
+            lock_state();
+            susfs_state_t state;
+            load_state(&state);
+            int exists = 0;
+            for (int i = 0; i < state.try_umount_count; i++) {
+                if (!strcmp(state.try_umount[i].path, argv[2])) {
+                    exists = 1;
+                    break;
+                }
+            }
+            if (!exists && state.try_umount_count < MAX_ENTRIES) {
+                strncpy(state.try_umount[state.try_umount_count].path, argv[2], SUSFS_MAX_LEN_PATHNAME - 1);
+                state.try_umount[state.try_umount_count].mode = mode;
+                state.try_umount_count++;
+                save_state_atomic(&state);
+                printf("[+] Successfully added Try Umount: %s (mode: %d)\n", argv[2], mode);
+            } else {
+                printf("[!] Already configured in state: %s\n", argv[2]);
+            }
+            unlock_state();
+        } else {
+            printf("[-] Failed adding Try Umount (ret: %d)\n", ret);
+            return 1;
+        }
+    } else if (!strcmp(argv[1], "sus_su") && argc >= 3) {
+        int val = atoi(argv[2]);
+        int fd = get_ksu_fd();
+        struct st_sus_su info = {0};
+        info.enabled = val;
+        int ret = ioctl(fd, CMD_SUSFS_SUS_SU, &info);
+        close(fd);
+
+        if (ret == 0) {
+            lock_state();
+            susfs_state_t state;
+            load_state(&state);
+            state.sus_su = val;
+            save_state_atomic(&state);
+            unlock_state();
+            printf("[+] Set SUS SU Hiding to: %d\n", val);
+        } else {
+            printf("[-] Failed setting SUS SU (ret: %d)\n", ret);
+            return 1;
+        }
     } else if (!strcmp(argv[1], "add_sus_kstat") && argc >= 3) {
         struct stat sb;
         if (stat(argv[2], &sb) != 0) {
@@ -255,26 +736,80 @@ int main(int argc, char *argv[]) {
         info.spoofed_blocks = sb.st_blocks;
 
         int ret = ioctl(fd, CMD_SUSFS_ADD_SUS_KSTAT, &info);
+        close(fd);
+
         if (ret == 0) {
-            printf("[+] Successfully added SUS Kstat: %s\n", argv[2]);
+            lock_state();
+            susfs_state_t state;
+            load_state(&state);
+            int exists = 0;
+            for (int i = 0; i < state.sus_kstat_count; i++) {
+                if (!strcmp(state.sus_kstat[i].path, argv[2])) {
+                    exists = 1;
+                    break;
+                }
+            }
+            if (!exists && state.sus_kstat_count < MAX_ENTRIES) {
+                strncpy(state.sus_kstat[state.sus_kstat_count].path, argv[2], SUSFS_MAX_LEN_PATHNAME - 1);
+                state.sus_kstat_count++;
+                save_state_atomic(&state);
+                printf("[+] Successfully added SUS Kstat: %s\n", argv[2]);
+            } else {
+                printf("[!] Already configured in state: %s\n", argv[2]);
+            }
+            unlock_state();
         } else {
             printf("[-] Failed adding SUS Kstat (ret: %d)\n", ret);
+            return 1;
         }
-        close(fd);
     } else if (!strcmp(argv[1], "set_uname") && argc >= 4) {
         int fd = get_ksu_fd();
         struct st_susfs_uname info = {0};
         strncpy(info.release, argv[2], 64);
         strncpy(info.version, argv[3], 64);
         int ret = ioctl(fd, CMD_SUSFS_SET_UNAME, &info);
-        printf("[+] Set Uname Spoofing returned: %d\n", ret);
         close(fd);
+
+        if (ret == 0) {
+            lock_state();
+            susfs_state_t state;
+            load_state(&state);
+            strncpy(state.uname_release, argv[2], 64);
+            strncpy(state.uname_version, argv[3], 64);
+            save_state_atomic(&state);
+            unlock_state();
+            printf("[+] Set Uname Spoofing returned: %d\n", ret);
+        } else {
+            printf("[-] Failed setting Uname (ret: %d)\n", ret);
+            return 1;
+        }
     } else if (!strcmp(argv[1], "enable_log") && argc >= 3) {
         int fd = get_ksu_fd();
         int val = atoi(argv[2]);
         int ret = ioctl(fd, CMD_SUSFS_ENABLE_LOG, (unsigned long)val);
-        printf("[+] Enable Log returned: %d\n", ret);
         close(fd);
+        printf("[+] Enable Log returned: %d\n", ret);
+    } else if (!strcmp(argv[1], "list")) {
+        cmd_list(json_mode);
+    } else if (!strcmp(argv[1], "restore")) {
+        return cmd_restore(json_mode);
+    } else if (!strcmp(argv[1], "auto_hide")) {
+        printf("[+] Running 1-Click Auto Hide...\n");
+        const char *preset_paths[] = {
+            "/data/adb/modules",
+            "/data/adb/ksu",
+            "/system/bin/su",
+            "/system/xbin/su"
+        };
+        int num_presets = sizeof(preset_paths) / sizeof(preset_paths[0]);
+        for (int i = 0; i < num_presets; i++) {
+            struct stat sb;
+            if (stat(preset_paths[i], &sb) == 0) {
+                char cmd[512];
+                snprintf(cmd, sizeof(cmd), "%s add_sus_path %s", argv[0], preset_paths[i]);
+                system(cmd);
+            }
+        }
     } else if (!strcmp(argv[1], "status") || json_mode) {
         if (json_mode) {
             print_status_json();
